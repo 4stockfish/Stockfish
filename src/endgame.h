@@ -1,7 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
-  Copyright (C) 2008-2013 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2004-2020 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -20,20 +19,23 @@
 #ifndef ENDGAME_H_INCLUDED
 #define ENDGAME_H_INCLUDED
 
-#include <map>
+#include <memory>
 #include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
 
 #include "position.h"
 #include "types.h"
 
 
-/// EndgameType lists all supported endgames
+/// EndgameCode lists all supported endgame functions by corresponding codes
 
-enum EndgameType {
+enum EndgameCode {
 
-  // Evaluation functions
-
+  EVALUATION_FUNCTIONS,
   KNNK,  // KNN vs K
+  KNNKP, // KNN vs KP
   KXK,   // Generic "mate lone king" eval
   KBNK,  // KBN vs K
   KPK,   // KP vs K
@@ -42,81 +44,80 @@ enum EndgameType {
   KRKN,  // KR vs KN
   KQKP,  // KQ vs KP
   KQKR,  // KQ vs KR
-  KBBKN, // KBB vs KN
-  KmmKm, // K and two minors vs K and one or two minors
 
-
-  // Scaling functions
-  SCALE_FUNS,
-
-  KBPsK,   // KB+pawns vs K
-  KQKRPs,  // KQ vs KR+pawns
+  SCALING_FUNCTIONS,
+  KBPsK,   // KB and pawns vs K
+  KQKRPs,  // KQ vs KR and pawns
   KRPKR,   // KRP vs KR
+  KRPKB,   // KRP vs KB
   KRPPKRP, // KRPP vs KRP
-  KPsK,    // King and pawns vs king
+  KPsK,    // K and pawns vs K
   KBPKB,   // KBP vs KB
   KBPPKB,  // KBPP vs KB
   KBPKN,   // KBP vs KN
-  KNPK,    // KNP vs K
-  KNPKB,   // KNP vs KB
   KPKP     // KP vs KP
 };
 
 
-/// Endgame functions can be of two types according if return a Value or a
-/// ScaleFactor. Type eg_fun<int>::type equals to either ScaleFactor or Value
-/// depending if the template parameter is 0 or 1.
+/// Endgame functions can be of two types depending on whether they return a
+/// Value or a ScaleFactor.
 
-template<int> struct eg_fun { typedef Value type; };
-template<> struct eg_fun<1> { typedef ScaleFactor type; };
+template<EndgameCode E> using
+eg_type = typename std::conditional<(E < SCALING_FUNCTIONS), Value, ScaleFactor>::type;
 
 
-/// Base and derived templates for endgame evaluation and scaling functions
+/// Base and derived functors for endgame evaluation and scaling functions
 
 template<typename T>
 struct EndgameBase {
 
-  virtual ~EndgameBase() {}
-  virtual Color color() const = 0;
+  explicit EndgameBase(Color c) : strongSide(c), weakSide(~c) {}
+  virtual ~EndgameBase() = default;
   virtual T operator()(const Position&) const = 0;
+
+  const Color strongSide, weakSide;
 };
 
 
-template<EndgameType E, typename T = typename eg_fun<(E > SCALE_FUNS)>::type>
+template<EndgameCode E, typename T = eg_type<E>>
 struct Endgame : public EndgameBase<T> {
 
-  explicit Endgame(Color c) : strongerSide(c), weakerSide(~c) {}
-  Color color() const { return strongerSide; }
-  T operator()(const Position&) const;
-
-private:
-  Color strongerSide, weakerSide;
+  explicit Endgame(Color c) : EndgameBase<T>(c) {}
+  T operator()(const Position&) const override;
 };
 
 
-/// Endgames class stores in two std::map the pointers to endgame evaluation
-/// and scaling base objects. Then we use polymorphism to invoke the actual
-/// endgame function calling its operator() that is virtual.
+/// The Endgames namespace handles the pointers to endgame evaluation and scaling
+/// base objects in two std::map. We use polymorphism to invoke the actual
+/// endgame function by calling its virtual operator().
 
-class Endgames {
+namespace Endgames {
 
-  typedef std::map<Key, EndgameBase<eg_fun<0>::type>*> M1;
-  typedef std::map<Key, EndgameBase<eg_fun<1>::type>*> M2;
+  template<typename T> using Ptr = std::unique_ptr<EndgameBase<T>>;
+  template<typename T> using Map = std::unordered_map<Key, Ptr<T>>;
 
-  M1 m1;
-  M2 m2;
+  extern std::pair<Map<Value>, Map<ScaleFactor>> maps;
 
-  M1& map(M1::mapped_type) { return m1; }
-  M2& map(M2::mapped_type) { return m2; }
+  void init();
 
-  template<EndgameType E> void add(const std::string& code);
+  template<typename T>
+  Map<T>& map() {
+    return std::get<std::is_same<T, ScaleFactor>::value>(maps);
+  }
 
-public:
-  Endgames();
- ~Endgames();
+  template<EndgameCode E, typename T = eg_type<E>>
+  void add(const std::string& code) {
 
-  template<typename T> T probe(Key key, T& eg)
-  { return eg = map(eg).count(key) ? map(eg)[key] : NULL; }
-};
+    StateInfo st;
+    map<T>()[Position().set(code, WHITE, &st).material_key()] = Ptr<T>(new Endgame<E>(WHITE));
+    map<T>()[Position().set(code, BLACK, &st).material_key()] = Ptr<T>(new Endgame<E>(BLACK));
+  }
+
+  template<typename T>
+  const EndgameBase<T>* probe(Key key) {
+    auto it = map<T>().find(key);
+    return it != map<T>().end() ? it->second.get() : nullptr;
+  }
+}
 
 #endif // #ifndef ENDGAME_H_INCLUDED

@@ -1,7 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
-  Copyright (C) 2008-2013 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2004-2020 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -17,378 +16,256 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <algorithm> // For std::count
 #include <cassert>
 
+#include <algorithm> // For std::count
 #include "movegen.h"
 #include "search.h"
 #include "thread.h"
-#include "ucioption.h"
-
-using namespace Search;
+#include "uci.h"
+#include "syzygy/tbprobe.h"
+#include "tt.h"
 
 ThreadPool Threads; // Global object
 
-namespace {
 
- // start_routine() is the C function which is called when a new thread
- // is launched. It is a wrapper to the virtual function idle_loop().
+/// Thread constructor launches the thread and waits until it goes to sleep
+/// in idle_loop(). Note that 'searching' and 'exit' should be already set.
 
- extern "C" { long start_routine(ThreadBase* th) { th->idle_loop(); return 0; } }
+Thread::Thread(size_t n) : idx(n), stdThread(&Thread::idle_loop, this) {
 
-
- // Helpers to launch a thread after creation and joining before delete. Must be
- // outside Thread c'tor and d'tor because object shall be fully initialized
- // when start_routine (and hence virtual idle_loop) is called and when joining.
-
- template<typename T> T* new_thread() {
-   T* th = new T();
-   thread_create(th->handle, start_routine, th); // Will go to sleep
-   return th;
- }
-
- void delete_thread(ThreadBase* th) {
-   th->exit = true; // Search must be already finished
-   th->notify_one();
-   thread_join(th->handle); // Wait for thread termination
-   delete th;
- }
-
+  wait_for_search_finished();
 }
 
 
-// ThreadBase::notify_one() wakes up the thread when there is some work to do
+/// Thread destructor wakes up the thread in idle_loop() and waits
+/// for its termination. Thread should be already waiting.
 
-void ThreadBase::notify_one() {
+Thread::~Thread() {
 
-  mutex.lock();
-  sleepCondition.notify_one();
-  mutex.unlock();
+  assert(!searching);
+
+  exit = true;
+  start_searching();
+  stdThread.join();
 }
 
 
-// ThreadBase::wait_for() set the thread to sleep until condition 'b' turns true
+/// Thread::bestMoveCount(Move move) return best move counter for the given root move
 
-void ThreadBase::wait_for(volatile const bool& b) {
+int Thread::best_move_count(Move move) const {
 
-  mutex.lock();
-  while (!b) sleepCondition.wait(mutex);
-  mutex.unlock();
+  auto rm = std::find(rootMoves.begin() + pvIdx,
+                      rootMoves.begin() + pvLast, move);
+
+  return rm != rootMoves.begin() + pvLast ? rm->bestMoveCount : 0;
 }
 
 
-// Thread c'tor just inits data but does not launch any thread of execution that
-// instead will be started only upon c'tor returns.
+/// Thread::clear() reset histories, usually before a new game
 
-Thread::Thread() /* : splitPoints() */ { // Value-initialization bug in MSVC
+void Thread::clear() {
 
-  searching = false;
-  maxPly = splitPointsSize = 0;
-  activeSplitPoint = NULL;
-  activePosition = NULL;
-  idx = Threads.size();
+  counterMoves.fill(MOVE_NONE);
+  mainHistory.fill(0);
+  lowPlyHistory.fill(0);
+  captureHistory.fill(0);
+
+  for (bool inCheck : { false, true })
+      for (StatsType c : { NoCaptures, Captures })
+      {
+          for (auto& to : continuationHistory[inCheck][c])
+                for (auto& h : to)
+                      h->fill(0);
+          continuationHistory[inCheck][c][NO_PIECE][0]->fill(Search::CounterMovePruneThreshold - 1);
+      }
 }
 
 
-// TimerThread::idle_loop() is where the timer thread waits msec milliseconds
-// and then calls check_time(). If msec is 0 thread sleeps until is woken up.
-extern void check_time();
+/// Thread::start_searching() wakes up the thread that will start the search
 
-void TimerThread::idle_loop() {
+void Thread::start_searching() {
 
-  while (!exit)
-  {
-      mutex.lock();
-
-      if (!exit)
-          sleepCondition.wait_for(mutex, msec ? msec : INT_MAX);
-
-      mutex.unlock();
-
-      if (msec)
-          check_time();
-  }
+  std::lock_guard<std::mutex> lk(mutex);
+  searching = true;
+  cv.notify_one(); // Wake up the thread in idle_loop()
 }
 
 
-// MainThread::idle_loop() is where the main thread is parked waiting to be started
-// when there is a new search. Main thread will launch all the slave threads.
+/// Thread::wait_for_search_finished() blocks on the condition variable
+/// until the thread has finished searching.
 
-void MainThread::idle_loop() {
+void Thread::wait_for_search_finished() {
+
+  std::unique_lock<std::mutex> lk(mutex);
+  cv.wait(lk, [&]{ return !searching; });
+}
+
+
+/// Thread::idle_loop() is where the thread is parked, blocked on the
+/// condition variable, when it has no work to do.
+
+void Thread::idle_loop() {
+
+  // If OS already scheduled us on a different group than 0 then don't overwrite
+  // the choice, eventually we are one of many one-threaded processes running on
+  // some Windows NUMA hardware, for instance in fishtest. To make it simple,
+  // just check if running threads are below a threshold, in this case all this
+  // NUMA machinery is not needed.
+  if (Options["Threads"] > 8)
+      WinProcGroup::bindThisThread(idx);
 
   while (true)
   {
-      mutex.lock();
-
-      thinking = false;
-
-      while (!thinking && !exit)
-      {
-          Threads.sleepCondition.notify_one(); // Wake up UI thread if needed
-          sleepCondition.wait(mutex);
-      }
-
-      mutex.unlock();
+      std::unique_lock<std::mutex> lk(mutex);
+      searching = false;
+      cv.notify_one(); // Wake up anyone waiting for search finished
+      cv.wait(lk, [&]{ return searching; });
 
       if (exit)
           return;
 
-      searching = true;
+      lk.unlock();
 
-      Search::think();
+      search();
+  }
+}
 
-      assert(searching);
+/// ThreadPool::set() creates/destroys threads to match the requested number.
+/// Created and launched threads will immediately go to sleep in idle_loop.
+/// Upon resizing, threads are recreated to allow for binding if necessary.
 
-      searching = false;
+void ThreadPool::set(size_t requested) {
+
+  if (size() > 0) { // destroy any existing thread(s)
+      main()->wait_for_search_finished();
+
+      while (size() > 0)
+          delete back(), pop_back();
+  }
+
+  if (requested > 0) { // create new thread(s)
+      push_back(new MainThread(0));
+
+      while (size() < requested)
+          push_back(new Thread(size()));
+      clear();
+
+      // Reallocate the hash with the new threadpool size
+      TT.resize(size_t(Options["Hash"]));
+
+      // Init thread number dependent search params.
+      Search::init();
   }
 }
 
 
-// Thread::cutoff_occurred() checks whether a beta cutoff has occurred in the
-// current active split point, or in some ancestor of the split point.
+/// ThreadPool::clear() sets threadPool data to initial values
 
-bool Thread::cutoff_occurred() const {
+void ThreadPool::clear() {
 
-  for (SplitPoint* sp = activeSplitPoint; sp; sp = sp->parentSplitPoint)
-      if (sp->cutoff)
-          return true;
+  for (Thread* th : *this)
+      th->clear();
 
-  return false;
+  main()->callsCnt = 0;
+  main()->bestPreviousScore = VALUE_INFINITE;
+  main()->previousTimeReduction = 1.0;
 }
 
 
-// Thread::is_available_to() checks whether the thread is available to help the
-// thread 'master' at a split point. An obvious requirement is that thread must
-// be idle. With more than two threads, this is not sufficient: If the thread is
-// the master of some split point, it is only available as a slave to the slaves
-// which are busy searching the split point at the top of slaves split point
-// stack (the "helpful master concept" in YBWC terminology).
+/// ThreadPool::start_thinking() wakes up main thread waiting in idle_loop() and
+/// returns immediately. Main thread will wake up other threads and start the search.
 
-bool Thread::is_available_to(const Thread* master) const {
+void ThreadPool::start_thinking(Position& pos, StateListPtr& states,
+                                const Search::LimitsType& limits, bool ponderMode) {
 
-  if (searching)
-      return false;
+  main()->wait_for_search_finished();
 
-  // Make a local copy to be sure doesn't become zero under our feet while
-  // testing next condition and so leading to an out of bound access.
-  int size = splitPointsSize;
+  main()->stopOnPonderhit = stop = false;
+  increaseDepth = true;
+  main()->ponder = ponderMode;
+  Search::Limits = limits;
+  Search::RootMoves rootMoves;
 
-  // No split points means that the thread is available as a slave for any
-  // other thread otherwise apply the "helpful master" concept if possible.
-  return !size || (splitPoints[size - 1].slavesMask & (1ULL << master->idx));
-}
+  for (const auto& m : MoveList<LEGAL>(pos))
+      if (   limits.searchmoves.empty()
+          || std::count(limits.searchmoves.begin(), limits.searchmoves.end(), m))
+          rootMoves.emplace_back(m);
 
+  if (!rootMoves.empty())
+      Tablebases::rank_root_moves(pos, rootMoves);
 
-// init() is called at startup to create and launch requested threads, that will
-// go immediately to sleep due to 'sleepWhileIdle' set to true. We cannot use
-// a c'tor becuase Threads is a static object and we need a fully initialized
-// engine at this point due to allocation of Endgames in Thread c'tor.
+  // After ownership transfer 'states' becomes empty, so if we stop the search
+  // and call 'go' again without setting a new position states.get() == NULL.
+  assert(states.get() || setupStates.get());
 
-void ThreadPool::init() {
+  if (states.get())
+      setupStates = std::move(states); // Ownership transfer, states is now empty
 
-  sleepWhileIdle = true;
-  timer = new_thread<TimerThread>();
-  push_back(new_thread<MainThread>());
-  read_uci_options();
-}
-
-
-// exit() cleanly terminates the threads before the program exits
-
-void ThreadPool::exit() {
-
-  delete_thread(timer); // As first because check_time() accesses threads data
-
-  for (iterator it = begin(); it != end(); ++it)
-      delete_thread(*it);
-}
-
-
-// read_uci_options() updates internal threads parameters from the corresponding
-// UCI options and creates/destroys threads to match the requested number. Thread
-// objects are dynamically allocated to avoid creating in advance all possible
-// threads, with included pawns and material tables, if only few are used.
-
-void ThreadPool::read_uci_options() {
-
-  maxThreadsPerSplitPoint = Options["Max Threads per Split Point"];
-  minimumSplitDepth       = Options["Min Split Depth"] * ONE_PLY;
-  size_t requested        = Options["Threads"];
-
-  assert(requested > 0);
-
-  // Value 0 has a special meaning: We determine the optimal minimum split depth
-  // automatically. Anyhow the minimumSplitDepth should never be under 4 plies.
-  if (!minimumSplitDepth)
-      minimumSplitDepth = (requested < 8 ? 4 : 7) * ONE_PLY;
-  else
-      minimumSplitDepth = std::max(4 * ONE_PLY, minimumSplitDepth);
-
-  while (size() < requested)
-      push_back(new_thread<Thread>());
-
-  while (size() > requested)
+  // We use Position::set() to set root position across threads. But there are
+  // some StateInfo fields (previous, pliesFromNull, capturedPiece) that cannot
+  // be deduced from a fen string, so set() clears them and they are set from
+  // setupStates->back() later. The rootState is per thread, earlier states are shared
+  // since they are read-only.
+  for (Thread* th : *this)
   {
-      delete_thread(back());
-      pop_back();
+      th->nodes = th->tbHits = th->nmpMinPly = th->bestMoveChanges = 0;
+      th->rootDepth = th->completedDepth = 0;
+      th->rootMoves = rootMoves;
+      th->rootPos.set(pos.fen(), pos.is_chess960(), &th->rootState, th);
+      th->rootState = setupStates->back();
   }
+
+  main()->start_searching();
+}
+
+Thread* ThreadPool::get_best_thread() const {
+
+    Thread* bestThread = front();
+    std::map<Move, int64_t> votes;
+    Value minScore = VALUE_NONE;
+
+    // Find minimum score of all threads
+    for (Thread* th: *this)
+        minScore = std::min(minScore, th->rootMoves[0].score);
+
+    // Vote according to score and depth, and select the best thread
+    for (Thread* th : *this)
+    {
+        votes[th->rootMoves[0].pv[0]] +=
+            (th->rootMoves[0].score - minScore + 14) * int(th->completedDepth);
+
+          if (abs(bestThread->rootMoves[0].score) >= VALUE_TB_WIN_IN_MAX_PLY)
+          {
+              // Make sure we pick the shortest mate / TB conversion or stave off mate the longest
+              if (th->rootMoves[0].score > bestThread->rootMoves[0].score)
+                  bestThread = th;
+          }
+          else if (   th->rootMoves[0].score >= VALUE_TB_WIN_IN_MAX_PLY
+                   || (   th->rootMoves[0].score > VALUE_TB_LOSS_IN_MAX_PLY
+                       && votes[th->rootMoves[0].pv[0]] > votes[bestThread->rootMoves[0].pv[0]]))
+              bestThread = th;
+    }
+
+    return bestThread;
 }
 
 
-// slave_available() tries to find an idle thread which is available as a slave
-// for the thread 'master'.
+/// Start non-main threads
 
-Thread* ThreadPool::available_slave(const Thread* master) const {
+void ThreadPool::start_searching() {
 
-  for (const_iterator it = begin(); it != end(); ++it)
-      if ((*it)->is_available_to(master))
-          return *it;
-
-  return NULL;
+    for (Thread* th : *this)
+        if (th != front())
+            th->start_searching();
 }
 
 
-// split() does the actual work of distributing the work at a node between
-// several available threads. If it does not succeed in splitting the node
-// (because no idle threads are available), the function immediately returns.
-// If splitting is possible, a SplitPoint object is initialized with all the
-// data that must be copied to the helper threads and then helper threads are
-// told that they have been assigned work. This will cause them to instantly
-// leave their idle loops and call search(). When all threads have returned from
-// search() then split() returns.
+/// Wait for non-main threads
 
-template <bool Fake>
-void Thread::split(Position& pos, const Stack* ss, Value alpha, Value beta, Value* bestValue,
-                   Move* bestMove, Depth depth, Move threatMove, int moveCount,
-                   MovePicker* movePicker, int nodeType, bool cutNode) {
+void ThreadPool::wait_for_search_finished() const {
 
-  assert(pos.pos_is_ok());
-  assert(*bestValue <= alpha && alpha < beta && beta <= VALUE_INFINITE);
-  assert(*bestValue > -VALUE_INFINITE);
-  assert(depth >= Threads.minimumSplitDepth);
-  assert(searching);
-  assert(splitPointsSize < MAX_SPLITPOINTS_PER_THREAD);
-
-  // Pick the next available split point from the split point stack
-  SplitPoint& sp = splitPoints[splitPointsSize];
-
-  sp.masterThread = this;
-  sp.parentSplitPoint = activeSplitPoint;
-  sp.slavesMask = 1ULL << idx;
-  sp.depth = depth;
-  sp.bestValue = *bestValue;
-  sp.bestMove = *bestMove;
-  sp.threatMove = threatMove;
-  sp.alpha = alpha;
-  sp.beta = beta;
-  sp.nodeType = nodeType;
-  sp.cutNode = cutNode;
-  sp.movePicker = movePicker;
-  sp.moveCount = moveCount;
-  sp.pos = &pos;
-  sp.nodes = 0;
-  sp.cutoff = false;
-  sp.ss = ss;
-
-  // Try to allocate available threads and ask them to start searching setting
-  // 'searching' flag. This must be done under lock protection to avoid concurrent
-  // allocation of the same slave by another master.
-  Threads.mutex.lock();
-  sp.mutex.lock();
-
-  splitPointsSize++;
-  activeSplitPoint = &sp;
-  activePosition = NULL;
-
-  size_t slavesCnt = 1; // This thread is always included
-  Thread* slave;
-
-  while (    (slave = Threads.available_slave(this)) != NULL
-         && ++slavesCnt <= Threads.maxThreadsPerSplitPoint && !Fake)
-  {
-      sp.slavesMask |= 1ULL << slave->idx;
-      slave->activeSplitPoint = &sp;
-      slave->searching = true; // Slave leaves idle_loop()
-      slave->notify_one(); // Could be sleeping
-  }
-
-  // Everything is set up. The master thread enters the idle loop, from which
-  // it will instantly launch a search, because its 'searching' flag is set.
-  // The thread will return from the idle loop when all slaves have finished
-  // their work at this split point.
-  if (slavesCnt > 1 || Fake)
-  {
-      sp.mutex.unlock();
-      Threads.mutex.unlock();
-
-      Thread::idle_loop(); // Force a call to base class idle_loop()
-
-      // In helpful master concept a master can help only a sub-tree of its split
-      // point, and because here is all finished is not possible master is booked.
-      assert(!searching);
-      assert(!activePosition);
-
-      // We have returned from the idle loop, which means that all threads are
-      // finished. Note that setting 'searching' and decreasing splitPointsSize is
-      // done under lock protection to avoid a race with Thread::is_available_to().
-      Threads.mutex.lock();
-      sp.mutex.lock();
-  }
-
-  searching = true;
-  splitPointsSize--;
-  activeSplitPoint = sp.parentSplitPoint;
-  activePosition = &pos;
-  pos.set_nodes_searched(pos.nodes_searched() + sp.nodes);
-  *bestMove = sp.bestMove;
-  *bestValue = sp.bestValue;
-
-  sp.mutex.unlock();
-  Threads.mutex.unlock();
-}
-
-// Explicit template instantiations
-template void Thread::split<false>(Position&, const Stack*, Value, Value, Value*, Move*, Depth, Move, int, MovePicker*, int, bool);
-template void Thread::split< true>(Position&, const Stack*, Value, Value, Value*, Move*, Depth, Move, int, MovePicker*, int, bool);
-
-
-// wait_for_think_finished() waits for main thread to go to sleep then returns
-
-void ThreadPool::wait_for_think_finished() {
-
-  MainThread* t = main();
-  t->mutex.lock();
-  while (t->thinking) sleepCondition.wait(t->mutex);
-  t->mutex.unlock();
-}
-
-
-// start_thinking() wakes up the main thread sleeping in MainThread::idle_loop()
-// so to start a new search, then returns immediately.
-
-void ThreadPool::start_thinking(const Position& pos, const LimitsType& limits,
-                                const std::vector<Move>& searchMoves, StateStackPtr& states) {
-  wait_for_think_finished();
-
-  SearchTime = Time::now(); // As early as possible
-
-  Signals.stopOnPonderhit = Signals.firstRootMove = false;
-  Signals.stop = Signals.failedLowAtRoot = false;
-
-  RootMoves.clear();
-  RootPos = pos;
-  Limits = limits;
-  if (states.get()) // If we don't set a new position, preserve current state
-  {
-      SetupStates = states; // Ownership transfer here
-      assert(!states.get());
-  }
-
-  for (MoveList<LEGAL> it(pos); *it; ++it)
-      if (   searchMoves.empty()
-          || std::count(searchMoves.begin(), searchMoves.end(), *it))
-          RootMoves.push_back(RootMove(*it));
-
-  main()->thinking = true;
-  main()->notify_one(); // Starts main thread
+    for (Thread* th : *this)
+        if (th != front())
+            th->wait_for_search_finished();
 }

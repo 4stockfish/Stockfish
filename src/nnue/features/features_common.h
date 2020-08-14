@@ -1,7 +1,6 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
-  Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
-  Copyright (C) 2008-2013 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2004-2020 The Stockfish developers (see AUTHORS file)
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -17,29 +16,30 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#ifndef BOOK_H_INCLUDED
-#define BOOK_H_INCLUDED
+//Common header of input features of NNUE evaluation function
 
-#include <fstream>
-#include <string>
+#ifndef NNUE_FEATURES_COMMON_H_INCLUDED
+#define NNUE_FEATURES_COMMON_H_INCLUDED
 
-#include "position.h"
-#include "rkiss.h"
+#include "../../evaluate.h"
+#include "../nnue_common.h"
 
-class PolyglotBook : private std::ifstream {
-public:
-  PolyglotBook();
- ~PolyglotBook();
-  Move probe(const Position& pos, const std::string& fName, bool pickBest);
+namespace Eval::NNUE::Features {
 
-private:
-  template<typename T> PolyglotBook& operator>>(T& n);
+  class IndexList;
 
-  bool open(const char* fName);
-  size_t find_first(Key key);
+  template <typename... FeatureTypes>
+  class FeatureSet;
 
-  RKISS rkiss;
-  std::string fileName;
-};
+  // Trigger to perform full calculations instead of difference only
+  enum class TriggerEvent {
+    kFriendKingMoved // calculate full evaluation when own king moves
+  };
 
-#endif // #ifndef BOOK_H_INCLUDED
+  enum class Side {
+    kFriend // side to move
+  };
+
+}  // namespace Eval::NNUE::Features
+
+#endif // #ifndef NNUE_FEATURES_COMMON_H_INCLUDED
